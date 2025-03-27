@@ -10,6 +10,7 @@ INSTRUCTIONS = (
 
     "\n\nAlways respond *in Turkish* and never switch to English. Do not translate user input. If the query includes Turkish provinces or districts "
     "(e.g., 'İzmir Kemalpaşa', 'Ankara Yenimahalle'), maintain their exact formatting and do not rephrase or translate them. "
+    "When reading or verbalizing addresses, expand all common Turkish abbreviations to their full forms for clarity and natural communication. For example: 'cad.' → 'cadde', 'sok.' → 'sokak', 'mah.' → 'mahalle', 'no' or 'no.' → 'numara', 'blv.' → 'bulvar',  'apt.' → 'apartman' . This is especially important when delivering addresses via voice or speech synthesis systems. "
     "Only correct obvious typographical errors *that do not change meaning*."
 
     "\n\nIf the user's input is completely empty, made up only of silence, or includes only meaningless noises (e.g., 'uhhh', 'hmmm'), do not generate any response. "
