@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sesli Konuşma Kaydı</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      background-color: #f0f0f0;
+    }
+    button {
+      font-size: 18px;
+      padding: 10px 20px;
+      margin: 10px;
+      cursor: pointer;
+      border: none;
+      border-radius: 5px;
+      transition: background-color 0.3s;
+    }
+    #toggleAudio {
+      background-color: #4CAF50;
+      color: white;
+    }
+    #toggleAudio:hover {
+      background-color: #45a049;
+    }
+    #finishConversation {
+      background-color: #e74c3c;
+      color: white;
+    }
+    #finishConversation:hover {
+      background-color: #c0392b;
+    }
+  </style>
+</head>
+<body>
+  <button id="toggleAudio">Start Audio</button>
+  <button id="finishConversation" style="display:none;">Bitir ve Kaydet</button>
+
+  <script>
+    const BUFFER_SIZE = 4800;
+    let sharedAudioContext;
+    let mediaRecorder;
+    let recordedChunks = [];
+    let ws;  // WebSocket referansı
+
+    // Ortak kayıt akışı için MediaStreamDestination oluşturuyoruz.
+    let recorderDestination;
+
+    // Player: Yapay zeka ses çıkışı için.
+    class Player {
+      constructor(context) {
+        this.audioContext = context;
+        this.playbackNode = null;
+      }
+      async init() {
+        await this.audioContext.audioWorklet.addModule("/audio-playback-worklet.js");
+        this.playbackNode = new AudioWorkletNode(this.audioContext, "audio-playback-worklet");
+        // Hoparlöre çıkış için
+        this.playbackNode.connect(this.audioContext.destination);
+      }
+      play(buffer) {
+        if (this.playbackNode) {
+          this.playbackNode.port.postMessage(buffer);
+        }
+      }
+      stop() {
+        if (this.playbackNode) {
+          this.playbackNode.port.postMessage(null);
+        }
+      }
+    }
+
+    // Recorder: Mikrofon verisini işleyip sunucuya göndermek için.
+    class Recorder {
+      constructor(context, onDataAvailable) {
+        this.audioContext = context;
+        this.onDataAvailable = onDataAvailable;
+        this.mediaStream = null;
+        this.mediaStreamSource = null;
+        this.workletNode = null;
+      }
+      async init() {
+        await this.audioContext.audioWorklet.addModule("/audio-processor-worklet.js");
+      }
+      async start(micStream) {
+        this.mediaStream = micStream;
+        this.mediaStreamSource = this.audioContext.createMediaStreamSource(this.mediaStream);
+        this.workletNode = new AudioWorkletNode(this.audioContext, "audio-processor-worklet");
+        this.workletNode.port.onmessage = event => {
+          this.onDataAvailable(event.data.buffer);
+        };
+        // Mikrofon verisini hem işleyiciye gönderiyoruz hem de kayıt için ortak destination'a bağlıyoruz.
+        this.mediaStreamSource.connect(this.workletNode);
+        this.mediaStreamSource.connect(recorderDestination);
+        this.workletNode.connect(this.audioContext.destination);
+      }
+      async stop() {
+        if (this.mediaStream) {
+          this.mediaStream.getTracks().forEach(track => track.stop());
+          this.mediaStream = null;
+        }
+      }
+    }
+
+    let player, recorder;
+    let buffer = new Uint8Array();
+
+    function appendToBuffer(newData) {
+      const newBuffer = new Uint8Array(buffer.length + newData.length);
+      newBuffer.set(buffer);
+      newBuffer.set(newData, buffer.length);
+      buffer = newBuffer;
+    }
+
+    // İşlenmiş mikrofon verisini toplayıp, sunucuya WebSocket üzerinden gönderiyoruz.
+    function handleAudioData(data) {
+      const samples = new Int16Array(data);
+      let sum = 0;
+      for (let i = 0; i < samples.length; i++) {
+        sum += Math.abs(samples[i]);
+      }
+      const avgAmplitude = sum / samples.length;
+      const amplitudeThreshold = 1500;
+      if (avgAmplitude < amplitudeThreshold) return;
+
+      appendToBuffer(new Uint8Array(data));
+      if (buffer.length >= BUFFER_SIZE) {
+        const toSend = new Uint8Array(buffer.slice(0, BUFFER_SIZE));
+        buffer = new Uint8Array(buffer.slice(BUFFER_SIZE));
+        const regularArray = String.fromCharCode(...toSend);
+        const base64 = btoa(regularArray);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: base64 }));
+        }
+      }
+    }
+
+    async function startAudio() {
+      try {
+        // Tek bir AudioContext oluşturuluyor.
+        sharedAudioContext = new AudioContext({ sampleRate: 24000 });
+
+        // Kayıt için ortak destination node oluşturuluyor.
+        recorderDestination = sharedAudioContext.createMediaStreamDestination();
+
+        // Player ve Recorder, ortak audio context üzerinden başlatılıyor.
+        player = new Player(sharedAudioContext);
+        await player.init();
+
+        recorder = new Recorder(sharedAudioContext, handleAudioData);
+        await recorder.init();
+
+        // Yapay zekanın hoparlör çıkışı da kayıt akışına eklensin diye, player çıktısını destination'a bağlıyoruz.
+        player.playbackNode.connect(recorderDestination);
+
+        // Kayıt işlemini başlatmak için MediaRecorder oluşturuluyor.
+        mediaRecorder = new MediaRecorder(recorderDestination.stream);
+        recordedChunks = [];
+        mediaRecorder.ondataavailable = e => {
+          if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+        mediaRecorder.onstop = () => {
+            const completeBlob = new Blob(recordedChunks, { type: 'audio/wav' });
+            console.log("Kayıt tamamlandı", completeBlob);
+          
+            // POST isteği ile kaydı sunucuya gönderiyoruz.
+            const formData = new FormData();
+            formData.append("recording", completeBlob, "konusma_kaydi.wav");
+          
+            fetch("/save_recording", {
+              method: "POST",
+              body: formData
+            })
+            .then(response => {
+              if (response.ok) {
+                console.log("Kayıt sunucuya başarıyla gönderildi.");
+              } else {
+                console.error("Kayıt gönderilirken hata oluştu.");
+              }
+            })
+            .catch(error => {
+              console.error("Fetch hatası:", error);
+            });
+          };
+          
+        mediaRecorder.start();
+
+        // WebSocket ile sunucu bağlantısı kuruluyor.
+        ws = new WebSocket("ws://localhost:3000/ws");
+        ws.onmessage = event => {
+          const data = JSON.parse(event.data);
+          if (data?.type !== 'response.audio.delta') return;
+          const binary = atob(data.delta);
+          const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+          const pcmData = new Int16Array(bytes.buffer);
+          player.play(pcmData);
+        };
+        ws.onclose = () => {
+          if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
+          }
+        };
+
+        // Mikrofon erişimi sağlanıyor.
+        const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        await recorder.start(micStream);
+
+        // Ses açıldığında bitiş butonunu görünür yapalım.
+        document.getElementById('finishConversation').style.display = 'inline-block';
+      } catch (error) {
+        console.error('Ses cihazlarına erişim hatası:', error);
+        alert('Ses cihazlarına erişilemedi. Lütfen ayarlarınızı kontrol edin.');
+      }
+    }
+
+    // Konuşma tamamlandığında kayıt işlemini sonlandırıp, dosyayı sunucuya göndermek için.
+    async function finishConversation() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+      if (recorder && recorder.mediaStream) {
+        recorder.mediaStream.getTracks().forEach(track => track.stop());
+      }
+      if (ws) {
+        ws.close();
+      }
+      document.getElementById('finishConversation').style.display = 'none';
+      document.getElementById('toggleAudio').textContent = 'Start Audio';
+      console.log("Konuşma tamamlandı, ses kaydı sunucuya gönderiliyor.");
+    }
+
+    const toggleButton = document.getElementById('toggleAudio');
+    const finishButton = document.getElementById('finishConversation');
+    let isAudioOn = false;
+    toggleButton.addEventListener('click', async () => {
+      if (!isAudioOn) {
+        await startAudio();
+        toggleButton.textContent = 'Stop Audio';
+        isAudioOn = true;
+      } else {
+        toggleButton.textContent = 'Start Audio';
+        isAudioOn = false;
+      }
+    });
+    finishButton.addEventListener('click', finishConversation);
+  </script>
+</body>
+</html>
